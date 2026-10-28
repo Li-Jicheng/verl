@@ -26,7 +26,13 @@ from veomni.arguments import AcceleratorConfig, FSDPConfig, MixedPrecisionConfig
 from veomni.distributed import parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.auto import build_foundation_model
-from veomni.models.checkpoint_tensor_loading import get_checkpoint_tensor_converter
+
+try:
+    from veomni.models.checkpoint import get_checkpoint_tensor_converter
+except ModuleNotFoundError as error:
+    if error.name != "veomni.models.checkpoint":
+        raise
+    from veomni.models.checkpoint_tensor_loading import get_checkpoint_tensor_converter
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
@@ -671,7 +677,13 @@ class VeOmniEngine(FSDPEngine):
             return converter.export_weights(self.module), None
 
         params = self.module.state_dict()
-        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        m3_spec = None
+        if getattr(self.module.config, "model_type", None) == "minimax_m3_vl":
+            from .m3_weight_export import M3ExportSpec
+
+            m3_spec = M3ExportSpec.from_config(self.module.config)
+        else:
+            params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
         if self._is_offload_param:
             offload_veomni_model_to_cpu(self.module)
@@ -687,6 +699,12 @@ class VeOmniEngine(FSDPEngine):
                 unsharded_tensor = (
                     param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
                 )
+
+                if m3_spec is not None:
+                    from .m3_weight_export import iter_m3_param
+
+                    yield from iter_m3_param(name, unsharded_tensor, m3_spec, ps)
+                    continue
 
                 is_expert_layer = "mlp.experts." in name
                 is_proj = any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])

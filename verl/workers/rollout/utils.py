@@ -114,6 +114,39 @@ def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
         return prompt_ids
 
 
+def minimax_m3_vl_collapse_image_tokens(prompt_ids: list[int], processor, num_images: int) -> list[int]:
+    """Restore one raw placeholder per image before vLLM expands MiniMax spans.
+
+    Unlike Qwen, vLLM MiniMax adds both vision boundary tokens itself. Keeping
+    the HF-expanded boundaries or pad run would change the inference prompt.
+    """
+    vocab = processor.tokenizer.get_vocab()
+    image_id = vocab["]<]image[>["]
+    start_id = vocab["]<]start of image[>["]
+    end_id = vocab["]<]end of image[>["]
+    result = []
+    image_count = 0
+    i = 0
+    while i < len(prompt_ids):
+        token_id = prompt_ids[i]
+        if token_id == start_id and i + 1 < len(prompt_ids) and prompt_ids[i + 1] == image_id:
+            j = i + 1
+            while j < len(prompt_ids) and prompt_ids[j] == image_id:
+                j += 1
+            if j == len(prompt_ids) or prompt_ids[j] != end_id:
+                raise ValueError("MiniMax image placeholder span is missing its end token")
+            result.append(image_id)
+            image_count += 1
+            i = j + 1
+            continue
+        result.append(token_id)
+        image_count += int(token_id == image_id)
+        i += 1
+    if image_count != num_images:
+        raise ValueError(f"MiniMax image placeholder count {image_count} does not match images {num_images}")
+    return result
+
+
 def get_vision_placeholder_token_ids(processor) -> list[int]:
     """Vision placeholder token ids the policy must never sample.
 

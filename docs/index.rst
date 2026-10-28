@@ -120,6 +120,7 @@ verl is fast with:
    advance/fsdp_extension
    advance/megatron_extension
    advance/deepseek_v4_integration
+   advance/minimax_m3_veomni
    advance/megatron_lite_backend
 
 .. toctree::
