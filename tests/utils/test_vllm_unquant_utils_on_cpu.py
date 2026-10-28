@@ -378,3 +378,71 @@ def test_a_layer_left_staged_by_a_failed_refit_is_restaged_from_its_live_params(
     for name, param in live.items():
         assert getattr(layer, name) is param
         assert torch.equal(param.data, _block_layout(weights[name]))
+
+
+@pytest.fixture
+def backend_alias(vllm, monkeypatch):
+    """A loaded hardware backend with its own imported replacement function."""
+    module = types.ModuleType("test_hardware_moe_backend")
+    module.replace_parameter = _replace_parameter
+
+    class HardwareMethod(vllm.unquantized.UnquantizedFusedMoEMethod):
+        def process_weights_after_loading(self, layer):
+            for name in self.names:
+                module.replace_parameter(layer, name, self.kernel_layout(getattr(layer, name).data))
+
+    HardwareMethod.__module__ = module.__name__
+    module.HardwareMethod = HardwareMethod
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return module
+
+
+def test_backend_alias_folds_each_layer_before_processing_the_next(vllm, backend_alias):
+    layers = [_FakeRoutedExperts(backend_alias.HardwareMethod(), seed=i) for i in range(3)]
+    model = _engine_init(vllm, layers)
+    live = [{name: getattr(layer, name) for name in ("w13_weight", "w2_weight")} for layer in layers]
+    staged = unquant_utils.stage_unquantized_moe_params(model)
+    weights = [_new_weights(seed=20 + i) for i in range(3)]
+    for layer, new in zip(layers, weights, strict=True):
+        _load(layer, new)
+
+    original = backend_alias.replace_parameter
+    with unquant_utils.fold_unquantized_moe_params(staged):
+        for i, layer in enumerate(layers):
+            layer.quant_method.process_weights_after_loading(layer)
+            for name, param in live[i].items():
+                assert getattr(layer, name) is param, "backend must fold before the next layer allocates"
+                assert torch.equal(param.data, _block_layout(weights[i][name]))
+    assert backend_alias.replace_parameter is original
+    assert vllm.unquantized.replace_parameter is _replace_parameter
+
+
+def test_backend_alias_and_upstream_are_restored_after_failure(vllm, backend_alias):
+    layer = _FakeRoutedExperts(backend_alias.HardwareMethod())
+    model = _engine_init(vllm, [layer])
+    staged = unquant_utils.stage_unquantized_moe_params(model)
+    with pytest.raises(RuntimeError, match="post-load failed"):
+        with unquant_utils.fold_unquantized_moe_params(staged):
+            assert backend_alias.replace_parameter is not _replace_parameter
+            assert vllm.unquantized.replace_parameter is not _replace_parameter
+            raise RuntimeError("post-load failed")
+    assert backend_alias.replace_parameter is _replace_parameter
+    assert vllm.unquantized.replace_parameter is _replace_parameter
+
+
+def test_mixed_backend_and_upstream_layers_share_the_scoped_fold(vllm, backend_alias):
+    layers = [
+        _FakeRoutedExperts(vllm.unquantized.UnquantizedFusedMoEMethod()),
+        _FakeRoutedExperts(backend_alias.HardwareMethod()),
+        _FakeRoutedExperts(backend_alias.HardwareMethod()),
+    ]
+    model = _engine_init(vllm, layers)
+    live = [layer.w13_weight for layer in layers]
+    staged = unquant_utils.stage_unquantized_moe_params(model)
+    for i, layer in enumerate(layers):
+        _load(layer, _new_weights(seed=30 + i))
+    with unquant_utils.fold_unquantized_moe_params(staged):
+        for layer, param in zip(layers, live, strict=True):
+            layer.quant_method.process_weights_after_loading(layer)
+            assert layer.w13_weight is param
+    assert backend_alias.replace_parameter is _replace_parameter

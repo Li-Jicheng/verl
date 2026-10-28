@@ -41,7 +41,8 @@ engine starts.
 import logging
 import math
 import os
-from contextlib import contextmanager
+import sys
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 import torch
@@ -163,8 +164,19 @@ def fold_unquantized_moe_params(layers: list[torch.nn.Module]):
 
     from vllm.model_executor.layers.fused_moe import unquantized_fused_moe_method
 
-    folding = _folding_replace_parameter(unquantized_fused_moe_method.replace_parameter)
-    with patch.object(unquantized_fused_moe_method, "replace_parameter", folding):
+    modules = [unquantized_fused_moe_method]
+    for layer in layers:
+        # Hardware backends can import replace_parameter into their own namespace.
+        # They are already loaded by model initialization; do not import optional plugins here.
+        backend = sys.modules.get(type(layer.quant_method).__module__)
+        if backend is not None and backend not in modules and hasattr(backend, "replace_parameter"):
+            modules.append(backend)
+
+    with ExitStack() as patches:
+        for module in modules:
+            patches.enter_context(
+                patch.object(module, "replace_parameter", _folding_replace_parameter(module.replace_parameter))
+            )
         yield
 
     for layer in layers:
