@@ -226,6 +226,8 @@ def hf_processor(name_or_path, **kwargs):
                 from transformers.models.glm46v import Glm46VModel
 
                 model_class = Glm46VModel
+            case "MiniMaxM3VLProcessor" | "MiniMaxVLProcessor":
+                pass  # Text positions are one-dimensional; visual RoPE is owned by the vision tower.
             case "MllamaProcessor":
                 pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
             case "Gemma4Processor":

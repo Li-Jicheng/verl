@@ -59,6 +59,7 @@ from verl.workers.rollout.utils import (
     extract_response_topk_logprobs_with_coverage,
     get_max_position_embeddings,
     get_vision_placeholder_token_ids,
+    minimax_m3_vl_collapse_image_tokens,
     qwen2_5_vl_dedup_image_tokens,
     run_uvicorn,
     validate_topk_logprob_request,
@@ -684,7 +685,13 @@ class vLLMHttpServer:
         budget_warnings = getattr(self, "_topk_budget_warnings", set())
         warn_topk_logprob_budget(sampling_params, budget_warnings)
         self._topk_budget_warnings = budget_warnings
+        original_prompt_ids = prompt_ids
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        minimax_image_prompt = (
+            image_data is not None and getattr(self.model_config.hf_config, "model_type", None) == "minimax_m3_vl"
+        )
+        if minimax_image_prompt:
+            prompt_ids = minimax_m3_vl_collapse_image_tokens(prompt_ids, self.model_config.processor, len(image_data))
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data
@@ -741,6 +748,12 @@ class vLLMHttpServer:
                 if not admitted:
                     self._admitting -= 1
             assert final_res is not None
+            if (
+                minimax_image_prompt
+                and prompt_ids != original_prompt_ids
+                and final_res.prompt_token_ids != original_prompt_ids
+            ):
+                raise RuntimeError("MiniMax vLLM expanded prompt differs from the training prompt")
 
         extra_fields = {"global_steps": self.global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),
