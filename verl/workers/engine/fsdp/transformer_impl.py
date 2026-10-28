@@ -98,6 +98,12 @@ def _is_scalar_unit_temperature(temperature) -> bool:
 def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bool):
     """Scale logits without copying the full vocabulary tensor for temperature 1."""
 
+    # Match inference postprocessing: upcast before temperature division,
+    # while retaining the default dtype and no-copy unit-temperature path.
+    # This does not change the lm_head matmul precision.
+    if os.environ.get("VERL_POLICY_FP32_LOGITS", "0") == "1":
+        logits = logits.float()
+
     if is_unit_temperature:
         return logits
     return logits / temperature.clamp(min=1e-8).to(logits.dtype)
