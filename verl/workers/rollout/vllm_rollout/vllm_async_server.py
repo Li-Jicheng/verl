@@ -220,20 +220,39 @@ class vLLMHttpServer:
         self.profiler_keep_global_ranks = rollout_profiler_global_ranks(profiler_config)
 
         # used for data parallel: --data-parallel-address, --data-parallel-rpc-port
+        self._master_sock = self._dp_rpc_sock = self._dp_master_sock = None
         if self.node_rank == 0:
             self._master_address = self._server_address
-            # used for torch.distributed.init_process_group
-            self._master_port, self._master_sock = get_free_port(self._server_address, with_alive_sock=True)
-            # used for data parallel: --data-parallel-address, --data-parallel-rpc-port
-            self._dp_rpc_port, self._dp_rpc_sock = get_free_port(self._server_address, with_alive_sock=True)
-            self._dp_master_port, self._dp_master_sock = get_free_port(self._server_address, with_alive_sock=True)
+            self._reserve_engine_ports()
         else:
             self._master_address = None
             self._master_port = None
             self._dp_rpc_port = None
             self._dp_master_port = None
 
-        self._post_init(cuda_visible_devices)
+        try:
+            self._post_init(cuda_visible_devices)
+        except BaseException:
+            self._release_engine_ports()
+            raise
+
+    def _reserve_engine_ports(self):
+        # The engine binds wildcard listeners, while peers still use the selected NIC.
+        address = "::" if is_valid_ipv6_address(self._server_address) else "0.0.0.0"
+        try:
+            self._master_port, self._master_sock = get_free_port(address, with_alive_sock=True)
+            self._dp_rpc_port, self._dp_rpc_sock = get_free_port(address, with_alive_sock=True)
+            self._dp_master_port, self._dp_master_sock = get_free_port(address, with_alive_sock=True)
+        except BaseException:
+            self._release_engine_ports()
+            raise
+
+    def _release_engine_ports(self):
+        for name in ("_master_sock", "_dp_rpc_sock", "_dp_master_sock"):
+            sock = getattr(self, name, None)
+            if sock is not None:
+                setattr(self, name, None)
+                sock.close()
 
     def get_master_address(self):
         """Get master address and port for data parallel.
@@ -291,6 +310,12 @@ class vLLMHttpServer:
         self._pd_prefill_engine_id = prefill_engine_id
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        try:
+            await self._launch_server(master_address, master_port, dp_rpc_port)
+        finally:
+            self._release_engine_ports()
+
+    async def _launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
                 "non-master node should provide master_address, master_port and dp_rpc_port"
@@ -523,6 +548,7 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
+        self._release_engine_ports()
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
         # Don't keep the dummy data in memory
